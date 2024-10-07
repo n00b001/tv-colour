@@ -10,6 +10,7 @@ import requests  # Import requests for API calls
 from plexapi.server import PlexServer
 
 from config import *
+from secrets import PLEX_TOKEN, YOUR_LONG_LIVED_ACCESS_TOKEN
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
