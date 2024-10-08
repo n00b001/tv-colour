@@ -26,10 +26,9 @@ cache_lock = multiprocessing.Lock()
 
 
 class PlexMonitor:
-    def __init__(self, plex_server_url, plex_token, ha_url, ha_entity_id):
+    def __init__(self, plex_server_url, plex_token, ha_url):
         self.plex = PlexServer(plex_server_url, plex_token)
         self.ha_url = ha_url
-        self.ha_entity_id = ha_entity_id
         self.loop_times = []
         self.loop_start_time = time.time()
         self.last_frame_log_time = 0
@@ -73,20 +72,26 @@ class PlexMonitor:
             del session_cache[guid]
 
     def get_average_color(self, video_path, playback_time_ms, avg_loop_time_ms):
-        """Retrieve the average color over multiple frames starting at the given playback time."""
+        """Retrieve the average color for left and right halves over multiple frames starting at the given playback time."""
         cap = self._get_video_capture(video_path)
 
         if cap is None:
-            return None
+            return None, None
 
         frame_count = self._calculate_frame_count(cap, avg_loop_time_ms)
         cap.set(cv2.CAP_PROP_POS_MSEC, playback_time_ms + avg_loop_time_ms + TIME_TO_SET_LIGHT_MS)
         frames = self._retrieve_frames(cap, frame_count)
         if len(frames) == 0:
-            return None
+            return None, None
 
-        colour_list = np.mean(np.stack(frames, axis=0), axis=(0, 1, 2))[::-1].tolist()
-        return colour_list
+        # Split each frame into left and right halves and compute the average color separately
+        left_frames = [frame[:, :frame.shape[1] // 2, :] for frame in frames]
+        right_frames = [frame[:, frame.shape[1] // 2:, :] for frame in frames]
+
+        left_color_avg = np.mean(np.stack(left_frames, axis=0), axis=(0, 1, 2))[::-1].tolist()
+        right_color_avg = np.mean(np.stack(right_frames, axis=0), axis=(0, 1, 2))[::-1].tolist()
+
+        return left_color_avg, right_color_avg
 
     def _get_video_capture(self, video_path):
         with cache_lock:
@@ -135,15 +140,18 @@ class PlexMonitor:
 
         return (X / (X + Y + Z), Y / (X + Y + Z)) if X + Y + Z else (0, 0)
 
-    def set_light_color(self, color, avg_loop_time_ms):
-        """Set the color of the lights in Home Assistant with a transition using XY color space."""
+    def set_light_color(self, color, avg_loop_time_ms, ha_entity_id):
+        """Set the color of the specified light in Home Assistant with a transition using XY color space."""
         current_time_ms = time.time() * 1000
         xy_color = self.rgb_to_xy(*color)
         brightness_pct = int(max(color) / 255.0 * 100)
 
-        if self._should_update_light(xy_color, current_time_ms):
+        while current_time_ms - self.last_light_update_time < TIME_TO_SET_LIGHT_MS:
+            current_time_ms = time.time() * 1000
+
+        if self._should_update_light(xy_color):
             payload = {
-                "entity_id": self.ha_entity_id,
+                "entity_id": ha_entity_id,
                 "xy_color": list(xy_color),
                 "brightness_pct": brightness_pct,
                 "transition": (avg_loop_time_ms / 1000) * 8,
@@ -152,11 +160,11 @@ class PlexMonitor:
             self.last_light_color = xy_color
             self.last_light_update_time = current_time_ms
 
-    def _should_update_light(self, xy_color, current_time_ms):
+    def _should_update_light(self, xy_color):
+
         return (
                 self.last_light_color is None
                 or xy_color != self.last_light_color
-                or current_time_ms - self.last_light_update_time >= TIME_TO_SET_LIGHT_MS
         )
 
     def _send_light_update(self, payload):
@@ -188,10 +196,18 @@ class PlexMonitor:
                             if os.name == 'nt':
                                 video_path = f"W:{video_path[7:]}"
 
-                            avg_color = self.get_average_color(video_path, session.viewOffset, avg_loop_time_ms)
-                            self.log_average_color(avg_color)
-                            if avg_color is not None:
-                                self.set_light_color(avg_color, avg_loop_time_ms)
+                            # Get the average color for the left and right halves
+                            left_color, right_color = self.get_average_color(
+                                video_path, session.viewOffset,
+                                avg_loop_time_ms
+                            )
+                            self.log_average_color(left_color)
+                            self.log_average_color(right_color)
+
+                            if left_color is not None and right_color is not None:
+                                # Set the left and right lights' colors
+                                self.set_light_color(left_color, avg_loop_time_ms, HA_LEFT_LIGHT)
+                                self.set_light_color(right_color, avg_loop_time_ms, HA_RIGHT_LIGHT)
             else:
                 time.sleep(10)
 
@@ -265,7 +281,6 @@ if __name__ == '__main__':
         PLEX_SERVER_URL,
         PLEX_TOKEN,
         HA_URL,  # Home Assistant URL
-        HA_ENTITY_ID  # Entity ID of the lights
     )
 
     # Start the background cache cleanup process
