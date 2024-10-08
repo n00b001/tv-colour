@@ -173,7 +173,7 @@ class PlexMonitor:
                             logger.error(f"Could not find media path for: {str(session)}")
                             continue
 
-                        video_path = f"W:/{video_path[7:]}"
+                        # video_path = f"W:/{video_path[7:]}"
 
                         # Directly call the video color calculation function
                         avg_color = self.get_average_color(
