@@ -14,27 +14,92 @@ from plexapi.server import PlexServer
 from config import *
 from secrets import PLEX_TOKEN, YOUR_LONG_LIVED_ACCESS_TOKEN
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-coloredlogs.install(level='INFO', logger=logger)
-
 # Cache to store video file connections and last access time
 video_cache = {}
 session_cache = {}
 cache_lock = multiprocessing.Lock()
 
 
-class PlexMonitor:
-    def __init__(self, plex_server_url, plex_token, ha_url):
-        self.plex = PlexServer(plex_server_url, plex_token)
+class LightController:
+    def __init__(self, ha_url, ha_entity_id):
+        # Setup logging
+        logging.basicConfig(level=logging.INFO)
+        self.logger = logging.getLogger(__name__)
+        coloredlogs.install(level='INFO', logger=self.logger)
+
         self.ha_url = ha_url
-        self.loop_times = []
-        self.loop_start_time = time.time()
-        self.last_frame_log_time = 0
+        self.ha_entity_id = ha_entity_id
         self.last_avg_color = None
         self.last_light_color = None
         self.last_light_update_time = 0
+
+    @staticmethod
+    def rgb_to_xy(r, g, b):
+        """Convert RGB to CIE 1931 XY color space."""
+
+        def gamma_correction(channel):
+            return ((channel + 0.055) / 1.055) ** 2.4 if channel > 0.04045 else channel / 12.92
+
+        r, g, b = [gamma_correction(channel / 255.0) for channel in (r, g, b)]
+        X = r * 0.4124 + g * 0.3576 + b * 0.1805
+        Y = r * 0.2126 + g * 0.7152 + b * 0.0722
+        Z = r * 0.0193 + g * 0.1192 + b * 0.9505
+        return (X / (X + Y + Z), Y / (X + Y + Z)) if X + Y + Z else (0, 0)
+
+    def set_light_color(self, color, avg_loop_time_ms):
+        """Set the light color via Home Assistant API."""
+        current_time_ms = time.time() * 1000
+        xy_color = self.rgb_to_xy(*color)
+        brightness_pct = int(max(color) / 255.0 * 100)
+
+        if self._should_update_light(xy_color):
+            payload = {
+                "entity_id": self.ha_entity_id,
+                "xy_color": list(xy_color),
+                "brightness_pct": brightness_pct,
+                "transition": (avg_loop_time_ms / 1000) * 8,
+            }
+            self._send_light_update(payload)
+            self.last_light_color = xy_color
+            self.last_light_update_time = current_time_ms
+
+    def _should_update_light(self, xy_color):
+        """Determine if the light color needs to be updated."""
+        return self.last_light_color is None or xy_color != self.last_light_color
+
+    def _send_light_update(self, payload):
+        """Send a request to update the light's color."""
+        headers = {
+            "Authorization": f"Bearer {YOUR_LONG_LIVED_ACCESS_TOKEN}",
+            "Content-Type": "application/json",
+        }
+        try:
+            response = requests.post(f"{self.ha_url}/api/services/light/turn_on", json=payload, headers=headers)
+            response.raise_for_status()
+            self.logger.info(
+                f"Set light {self.ha_entity_id} to color {payload['xy_color']} with brightness {payload['brightness_pct']}%"
+            )
+        except requests.exceptions.RequestException as e:
+            self.logger.error(f"Failed to set light color: {e}")
+
+
+class PlexMonitor:
+    def __init__(self, plex_server_url, plex_token, ha_url):
+        # Setup logging
+        logging.basicConfig(level=logging.INFO)
+        self.logger = logging.getLogger(__name__)
+        coloredlogs.install(level='INFO', logger=self.logger)
+
+        self.plex = PlexServer(plex_server_url, plex_token)
+        self.ha_url = ha_url
+        self.left_light = LightController(ha_url, HA_LEFT_LIGHT)
+        self.right_light = LightController(ha_url, HA_RIGHT_LIGHT)
+        self.loop_times = []
+        self.loop_start_time = time.time()
+        # self.last_frame_log_time = 0
+        # self.last_avg_color = None
+        # self.last_light_color = None
+        # self.last_light_update_time = 0
 
     def background_cache_cleanup(self):
         """Background process that removes old cache items every hour."""
@@ -57,7 +122,7 @@ class PlexMonitor:
         ]
 
         for video_path in items_to_remove:
-            logger.info(f"Removing cached video: {video_path}")
+            self.logger.info(f"Removing cached video: {video_path}")
             video_cache[video_path][0].release()
             del video_cache[video_path]
 
@@ -68,13 +133,12 @@ class PlexMonitor:
         ]
 
         for guid in items_to_remove:
-            logger.info(f"Removing cached session GUID: {guid}")
+            self.logger.info(f"Removing cached session GUID: {guid}")
             del session_cache[guid]
 
     def get_average_color(self, video_path, playback_time_ms, avg_loop_time_ms):
-        """Retrieve the average color for left and right halves over multiple frames starting at the given playback time."""
+        """Retrieve average color for left and right halves."""
         cap = self._get_video_capture(video_path)
-
         if cap is None:
             return None, None
 
@@ -84,7 +148,6 @@ class PlexMonitor:
         if len(frames) == 0:
             return None, None
 
-        # Split each frame into left and right halves and compute the average color separately
         left_frames = [frame[:, :frame.shape[1] // 2, :] for frame in frames]
         right_frames = [frame[:, frame.shape[1] // 2:, :] for frame in frames]
 
@@ -108,77 +171,22 @@ class PlexMonitor:
 
     def _calculate_frame_count(self, cap, avg_loop_time_ms):
         fps = cap.get(cv2.CAP_PROP_FPS)
-        return int((TIME_TO_SET_LIGHT_MS + avg_loop_time_ms) / 1000 * fps)
+        return int((AVERAGE_OVER_MS + avg_loop_time_ms) / 1000 * fps)
 
     def _retrieve_frames(self, cap, frame_count):
         frames = []
         for i in range(frame_count):
             if not cap.grab():
-                logger.warning(f"Failed to grab frame {i + 1}/{frame_count}")
+                self.logger.warning(f"Failed to grab frame {i + 1}/{frame_count}")
                 continue
 
             ret, frame = cap.retrieve()
             if ret:
                 frames.append(frame)
             else:
-                logger.warning(f"Failed to retrieve frame {i + 1}/{frame_count}")
+                self.logger.warning(f"Failed to retrieve frame {i + 1}/{frame_count}")
 
         return frames
-
-    @staticmethod
-    def rgb_to_xy(r, g, b):
-        """Convert RGB to CIE 1931 XY color space."""
-
-        def gamma_correction(channel):
-            return ((channel + 0.055) / 1.055) ** 2.4 if channel > 0.04045 else channel / 12.92
-
-        r, g, b = [gamma_correction(channel / 255.0) for channel in (r, g, b)]
-
-        X = r * 0.4124 + g * 0.3576 + b * 0.1805
-        Y = r * 0.2126 + g * 0.7152 + b * 0.0722
-        Z = r * 0.0193 + g * 0.1192 + b * 0.9505
-
-        return (X / (X + Y + Z), Y / (X + Y + Z)) if X + Y + Z else (0, 0)
-
-    def set_light_color(self, color, avg_loop_time_ms, ha_entity_id):
-        """Set the color of the specified light in Home Assistant with a transition using XY color space."""
-        current_time_ms = time.time() * 1000
-        xy_color = self.rgb_to_xy(*color)
-        brightness_pct = int(max(color) / 255.0 * 100)
-
-        while current_time_ms - self.last_light_update_time < TIME_TO_SET_LIGHT_MS:
-            current_time_ms = time.time() * 1000
-
-        if self._should_update_light(xy_color):
-            payload = {
-                "entity_id": ha_entity_id,
-                "xy_color": list(xy_color),
-                "brightness_pct": brightness_pct,
-                "transition": (avg_loop_time_ms / 1000) * 8,
-            }
-            self._send_light_update(payload)
-            self.last_light_color = xy_color
-            self.last_light_update_time = current_time_ms
-
-    def _should_update_light(self, xy_color):
-
-        return (
-                self.last_light_color is None
-                or xy_color != self.last_light_color
-        )
-
-    def _send_light_update(self, payload):
-        headers = {
-            "Authorization": f"Bearer {YOUR_LONG_LIVED_ACCESS_TOKEN}",
-            "Content-Type": "application/json"
-        }
-        try:
-            response = requests.post(f"{self.ha_url}/api/services/light/turn_on", json=payload, headers=headers)
-            response.raise_for_status()
-            logger.info(
-                f"Successfully set light color to {payload['xy_color']} with brightness: {payload['brightness_pct']}%")
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to set light color: {e}")
 
     def plex_monitor(self):
         """Monitor Plex for currently playing media and call the video-color function."""
@@ -196,20 +204,12 @@ class PlexMonitor:
                             if os.name == 'nt':
                                 video_path = f"W:{video_path[7:]}"
 
-                            # Get the average color for the left and right halves
                             left_color, right_color = self.get_average_color(
-                                video_path, session.viewOffset,
-                                avg_loop_time_ms
+                                video_path, session.viewOffset, avg_loop_time_ms
                             )
-                            self.log_average_color(left_color)
-                            self.log_average_color(right_color)
-
-                            if left_color is not None and right_color is not None:
-                                # Set the left and right lights' colors
-                                self.set_light_color(left_color, avg_loop_time_ms, HA_LEFT_LIGHT)
-                                self.set_light_color(right_color, avg_loop_time_ms, HA_RIGHT_LIGHT)
-            else:
-                time.sleep(10)
+                            if left_color and right_color:
+                                self.left_light.set_light_color(left_color, avg_loop_time_ms)
+                                self.right_light.set_light_color(right_color, avg_loop_time_ms)
 
             avg_loop_time_ms = self.log_loop_duration(loop_start, avg_loop_time_ms)
 
@@ -217,7 +217,7 @@ class PlexMonitor:
         try:
             return self.plex.sessions()
         except Exception as e:
-            logger.error(f"Error while monitoring Plex: {e}")
+            self.logger.error(f"Error while monitoring Plex: {e}")
             time.sleep(30)
             return []
 
@@ -244,23 +244,8 @@ class PlexMonitor:
             return self.plex.library.section("tv programmes").getGuid(session.grandparentGuid).get(session.title).media[
                 0].parts[0].file
         except Exception as e:
-            logger.warning(f"Failed to get video path from TV programmes: {e}")
+            self.logger.warning(f"Failed to get video path from TV programmes: {e}")
             return None
-
-    def log_average_color(self, avg_color):
-        """Log the average color if it has changed."""
-        if avg_color is not None:
-            if self.last_avg_color is None or avg_color != self.last_avg_color:
-                logger.info(f"Average Color: {avg_color}")
-                self.last_avg_color = avg_color
-        else:
-            self._log_frame_retrieval_failure()
-
-    def _log_frame_retrieval_failure(self):
-        current_time = time.time()
-        if current_time - self.last_frame_log_time >= FRAME_LOG_INTERVAL:
-            logger.info("Could not retrieve frame from the video.")
-            self.last_frame_log_time = current_time
 
     def log_loop_duration(self, loop_start, avg_loop_time_ms):
         """Calculate loop duration and log average time every 10 seconds."""
@@ -269,7 +254,7 @@ class PlexMonitor:
 
         if time.time() - self.loop_start_time >= 10:
             avg_loop_time_ms = np.mean(self.loop_times) * 1000
-            logger.info(f"Average loop time: {avg_loop_time_ms:.2f} ms")
+            self.logger.info(f"Average loop time: {avg_loop_time_ms:.2f} ms")
             self.loop_start_time = time.time()
             self.loop_times.clear()
 
@@ -290,11 +275,13 @@ if __name__ == '__main__':
 
     # Start the Plex monitoring thread
     # plex_thread = multiprocessing.Process(target=plex_monitor_instance.plex_monitor, daemon=True)
-    plex_thread = Thread(target=plex_monitor_instance.plex_monitor, daemon=True)
-    plex_thread.start()
 
-    logger.info("Plex monitor started...")
-
-    # Keep the main process alive
-    while True:
-        time.sleep(1)
+    print("Plex monitor starting...")
+    plex_monitor_instance.plex_monitor()
+    # plex_thread = Thread(target=plex_monitor_instance.plex_monitor, daemon=True)
+    # plex_thread.start()
+    #
+    #
+    # # Keep the main process alive
+    # while True:
+    #     time.sleep(60)

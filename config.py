@@ -12,5 +12,6 @@ HA_LEFT_LIGHT = "light.hue_living_room_1"
 HA_RIGHT_LIGHT = "light.hue_living_room_2"
 # HA_ENTITY_ID = "light.bedroom_2_bulb"
 
-TIME_TO_SET_LIGHT_MS = 500
+TIME_TO_SET_LIGHT_MS = 1_500
+AVERAGE_OVER_MS = 130
 TV_PLAYER = 'BRAVIA VH2'
