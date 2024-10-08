@@ -67,8 +67,8 @@ class PlexMonitor:
                 logger.info(f"Removing cached session GUID: {guid}")
                 del session_cache[guid]
 
-    def get_average_color(self, video_path, playback_time_milliseconds, loop_offset):
-        """Retrieve the average color of the frame at the given playback time."""
+    def get_average_color(self, video_path, playback_time_milliseconds, loop_offset, average_loop_time_milliseconds):
+        """Retrieve the average color over multiple frames starting at the given playback time."""
         with cache_lock:
             # Check if the video is already cached
             if video_path not in video_cache:
@@ -80,23 +80,41 @@ class PlexMonitor:
                 cap, _ = video_cache[video_path]
                 video_cache[video_path] = (cap, datetime.now())  # Update access time
 
-            # Set the frame position to the desired playback time
-            # Set to specific playback time in milliseconds
+            # Calculate the number of frames to read
+            frame_count = int(
+                (TIME_TO_SET_LIGHT_MS + average_loop_time_milliseconds) / 1000 * cap.get(cv2.CAP_PROP_FPS)
+            )
+
+            frames = []  # List to store frames for averaging
+
+            # Set the initial position to the desired playback time
             cap.set(
                 cv2.CAP_PROP_POS_MSEC,
                 playback_time_milliseconds + loop_offset + TIME_TO_SET_LIGHT_MS
             )
 
-            # Read the frame at that specific time
-            ret, frame = cap.read()
+            # Grab and retrieve frames
+            for i in range(frame_count):
+                # Grab the next frame
+                if not cap.grab():
+                    logger.warning(f"Failed to grab frame {i + 1}/{frame_count}")
+                    continue
 
-        if not ret:
-            return None
+                # Retrieve the current frame
+                ret, frame = cap.retrieve()
+                if ret:
+                    frames.append(frame)
+                else:
+                    logger.warning(f"Failed to retrieve frame {i + 1}/{frame_count}")
 
-        # Calculate the average color of the frame (in BGR format)
-        # avg_color_rgb = np.average(np.average(frame, axis=0), axis=0)[::-1]  # Convert BGR to RGB
-        avg_color_rgb = np.mean(frame, axis=(0, 1))[::-1]
-        return avg_color_rgb
+            if len(frames) == 0:
+                return None
+
+            # Stack frames and calculate the overall average color
+            stacked_frames = np.stack(frames, axis=0)
+            avg_color_rgb = np.mean(stacked_frames, axis=(0, 1, 2))[::-1]  # Average and convert BGR to RGB
+
+            return avg_color_rgb
 
     def rgb_to_xy(self, r, g, b):
         """Convert RGB to CIE 1931 XY color space."""
@@ -131,9 +149,10 @@ class PlexMonitor:
         brightness = int(max(color) / 255.0 * 100)  # Normalized to a percentage scale (0-100)
 
         # Prepare payload for the Home Assistant API call
+        xy_color_list = list(xy_color)
         payload = {
             "entity_id": self.ha_entity_id,
-            "xy_color": list(xy_color),  # Convert to list for API
+            "xy_color": xy_color_list,  # Convert to list for API
             "brightness_pct": brightness,  # Adjust brightness (0-100%)
             "transition": (average_loop_time_milliseconds / 1000) * 8,  # Adjust transition as needed
         }
@@ -153,7 +172,7 @@ class PlexMonitor:
                     json=payload, headers=headers
                 )
                 response.raise_for_status()  # Raise an error for bad responses
-                logger.info(f"Successfully set light color to XY: {xy_color} with brightness: {brightness}%")
+                logger.info(f"Successfully set light color to XY: {xy_color_list} with brightness: {brightness}%")
                 self.last_light_color = xy_color  # Update the last light color
             except requests.exceptions.RequestException as e:
                 logger.error(f"Failed to set light color: {e}")
